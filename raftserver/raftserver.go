@@ -94,6 +94,17 @@ func (s *Server) readStdin() {
 			s.mu.Lock()
 			s.state = Follower
 			s.mu.Unlock()
+			// Drain any pending timer fires accumulated while suspended
+			for {
+				select {
+				case <-s.resetElection:
+				default:
+					goto drained
+				}
+			}
+		drained:
+			// Now send a fresh reset to give heartbeats time to arrive
+			s.resetElection <- struct{}{}
 			log.Println("Server resumed")
 		default:
 			log.Printf("Unknown command: %s", line)
@@ -148,7 +159,7 @@ func main() {
 		state:         Follower,
 		currentTerm:   0,
 		votedFor:      "",
-		resetElection: make(chan struct{}, 1),
+		resetElection: make(chan struct{}, 10),
 	}
 
 	log.Printf("Listening on %s", selfID)
@@ -273,40 +284,52 @@ func readConfig(filename string) ([]string, error) {
 
 func (s *Server) runElectionTimer() {
 	for {
-		// Pick a random timeout between 150-300ms (per the paper §5.2)
-		timeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
+		// Check state at the start of each loop iteration
+		s.mu.Lock()
+		state := s.state
+		s.mu.Unlock()
+
+		// If Failed, wait a bit and check again — don't start timing
+		if state == Failed {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		timeout := time.Duration(300+rand.Intn(300)) * time.Millisecond
 
 		select {
 		case <-s.resetElection:
-			// received a heartbeat or granted a vote — reset the timer
-			continue
+			// heartbeat or vote received — reset the timer
 		case <-time.After(timeout):
-			// timer fired — check if we should start an election
 			s.mu.Lock()
 			state := s.state
 			s.mu.Unlock()
 
-			if state == Follower || state == Candidate {
+			if state == Follower {
 				go s.startElection()
 			}
-			// if Leader or Failed, do nothing
 		}
 	}
 }
 
 func (s *Server) startElection() {
+
 	s.mu.Lock()
+	if s.state == Failed || s.state == Leader || s.state == Candidate {
+		s.mu.Unlock()
+		return
+	}
+
 	s.state = Candidate
 	s.currentTerm++
 	s.votedFor = s.selfID
-	s.voteCount = 1 // vote for ourselves
+	s.voteCount = 1
 	term := s.currentTerm
 	lastLogIndex, lastLogTerm := s.lastLogInfo()
 	s.mu.Unlock()
 
 	log.Printf("Starting election for term %d", term)
 
-	// Send RequestVoteRequest to all peers except self
 	for _, peer := range s.peers {
 		if peer == s.selfID {
 			continue
@@ -322,6 +345,20 @@ func (s *Server) startElection() {
 				log.Printf("Failed to send RequestVote to %s: %v", target, err)
 			}
 		}(peer)
+	}
+
+	// Wait for election timeout — if we haven't won by then, start a new one
+	// This replaces the timer goroutine re-triggering us
+	timeout := time.Duration(300+rand.Intn(300)) * time.Millisecond
+	time.Sleep(timeout)
+
+	s.mu.Lock()
+	// If we're still a Candidate after the timeout, start a new election
+	stillCandidate := s.state == Candidate
+	s.mu.Unlock()
+
+	if stillCandidate {
+		go s.startElection()
 	}
 }
 
@@ -398,7 +435,8 @@ func (s *Server) handleRequestVoteResponse(res *miniraft.RequestVoteResponse, fr
 		s.voteCount++
 		log.Printf("Got vote, total=%d needed=%d", s.voteCount, s.majority())
 
-		if s.voteCount >= s.majority() {
+		// Only transition once — check we haven't already become leader
+		if s.voteCount == s.majority() { // == not >= so it only fires exactly once
 			go s.becomeLeader()
 		}
 	}
@@ -410,13 +448,17 @@ func (s *Server) majority() int {
 
 func (s *Server) becomeLeader() {
 	s.mu.Lock()
+	// Guard: if we're no longer a Candidate, don't become leader
+	if s.state != Candidate {
+		s.mu.Unlock()
+		return
+	}
 	s.state = Leader
 	s.leaderID = s.selfID
 	term := s.currentTerm
 	s.mu.Unlock()
 
 	log.Printf("Became leader for term %d!", term)
-
 	go s.runHeartbeat()
 }
 
