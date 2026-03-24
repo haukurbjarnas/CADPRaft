@@ -38,9 +38,22 @@ type Server struct {
 	votedFor    string
 	voteCount   int
 	leaderID    string
+	resumedAt   time.Time
 
-	// send any value here to reset the election timer
+	logFileReady bool
+
 	resetElection chan struct{}
+
+	// Raft log
+	log []miniraft.LogEntry
+
+	// Volatile state on all servers
+	commitIndex int
+	lastApplied int
+
+	// Volatile state on leaders only
+	nextIndex  map[string]int
+	matchIndex map[string]int
 }
 
 type ClientCommand struct {
@@ -50,15 +63,20 @@ type ClientCommand struct {
 func (s *Server) printLog() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// TODO: print log entries in Milestone 4
-	log.Println("Log: (empty)")
+	if len(s.log) == 0 {
+		log.Println("Log: (empty)")
+		return
+	}
+	for _, entry := range s.log {
+		log.Printf("  %d,%d,%s", entry.Term, entry.Index, entry.CommandName)
+	}
 }
 
 func (s *Server) printState() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// TODO: print full Raft state in Milestone 3/4
-	log.Printf("State: %v", s.state)
+	log.Printf("State: %v | Term: %d | VotedFor: %s | Leader: %s | commitIndex: %d | lastApplied: %d",
+		s.state, s.currentTerm, s.votedFor, s.leaderID, s.commitIndex, s.lastApplied)
 }
 
 func (s State) String() string {
@@ -160,6 +178,12 @@ func main() {
 		currentTerm:   0,
 		votedFor:      "",
 		resetElection: make(chan struct{}, 10),
+		resumedAt:     time.Now(),
+		log:           []miniraft.LogEntry{},
+		commitIndex:   0,
+		lastApplied:   0,
+		nextIndex:     make(map[string]int),
+		matchIndex:    make(map[string]int),
 	}
 
 	log.Printf("Listening on %s", selfID)
@@ -218,8 +242,7 @@ func (s *Server) handleMessage(raw []byte, from *net.UDPAddr) {
 			log.Printf("Failed to parse AppendEntriesResponse from %s: %v", from, err)
 			return
 		}
-		log.Printf("AppendEntriesResponse from %s: term=%d success=%v", from, res.Term, res.Success)
-		// TODO: handle in Milestone 4
+		go s.handleAppendEntriesResponse(res, from)
 
 	} else if bytes.Contains(raw, []byte(`"VoteGranted"`)) {
 		res := &miniraft.RequestVoteResponse{}
@@ -235,9 +258,7 @@ func (s *Server) handleMessage(raw []byte, from *net.UDPAddr) {
 			log.Printf("Failed to parse client command from %s: %v", from, err)
 			return
 		}
-		log.Printf("Client command from %s: %s", from, cmd.Command)
-		// TODO Milestone 4: leader appends to log, followers forward to leader
-
+		go s.handleClientCommand(cmd.Command, from)
 	} else {
 		log.Printf("Unknown message type from %s: %s", from, raw)
 	}
@@ -363,9 +384,11 @@ func (s *Server) startElection() {
 }
 
 func (s *Server) lastLogInfo() (int, int) {
-	// TODO: will use actual log in Milestone 4
-	// For now return 0, 0 (empty log)
-	return 0, 0
+	if len(s.log) == 0 {
+		return 0, 0
+	}
+	last := s.log[len(s.log)-1]
+	return last.Index, last.Term
 }
 
 func (s *Server) handleRequestVote(req *miniraft.RequestVoteRequest, from *net.UDPAddr) {
@@ -448,7 +471,6 @@ func (s *Server) majority() int {
 
 func (s *Server) becomeLeader() {
 	s.mu.Lock()
-	// Guard: if we're no longer a Candidate, don't become leader
 	if s.state != Candidate {
 		s.mu.Unlock()
 		return
@@ -456,13 +478,23 @@ func (s *Server) becomeLeader() {
 	s.state = Leader
 	s.leaderID = s.selfID
 	term := s.currentTerm
+
+	// Initialize nextIndex and matchIndex for all peers
+	lastIndex, _ := s.lastLogInfo()
+	for _, peer := range s.peers {
+		if peer == s.selfID {
+			continue
+		}
+		s.nextIndex[peer] = lastIndex + 1
+		s.matchIndex[peer] = 0
+	}
 	s.mu.Unlock()
 
 	log.Printf("Became leader for term %d!", term)
 	go s.runHeartbeat()
 }
 
-func (s *Server) runHeartbeat() {
+/*func (s *Server) runHeartbeat() {
 	for {
 		s.mu.Lock()
 		state := s.state
@@ -496,6 +528,23 @@ func (s *Server) runHeartbeat() {
 		// We use 75ms (half of minimum election timeout of 150ms)
 		time.Sleep(75 * time.Millisecond)
 	}
+}*/
+
+func (s *Server) runHeartbeat() {
+	for {
+		s.mu.Lock()
+		state := s.state
+		s.mu.Unlock()
+
+		if state != Leader {
+			return
+		}
+
+		// Heartbeat doubles as log replication
+		s.replicateLog()
+
+		time.Sleep(75 * time.Millisecond)
+	}
 }
 
 func (s *Server) handleAppendEntries(req *miniraft.AppendEntriesRequest, from *net.UDPAddr) {
@@ -513,7 +562,6 @@ func (s *Server) handleAppendEntries(req *miniraft.AppendEntriesRequest, from *n
 		return
 	}
 
-	// Valid leader contact — update term and revert to follower if needed
 	if req.Term > s.currentTerm {
 		s.currentTerm = req.Term
 		s.votedFor = ""
@@ -521,16 +569,262 @@ func (s *Server) handleAppendEntries(req *miniraft.AppendEntriesRequest, from *n
 	s.state = Follower
 	s.leaderID = req.LeaderId
 
-	// Reset election timer — we heard from a valid leader
+	// Reset election timer
 	select {
 	case s.resetElection <- struct{}{}:
 	default:
 	}
 
+	// Rule 2: reply false if log doesn't contain entry at prevLogIndex
+	// with matching prevLogTerm
+	if req.PrevLogIndex > 0 {
+		if req.PrevLogIndex > len(s.log) {
+			// We don't have this entry at all
+			s.sendMessage(from.String(), response)
+			return
+		}
+		if s.log[req.PrevLogIndex-1].Term != req.PrevLogTerm {
+			// Term mismatch at prevLogIndex
+			s.sendMessage(from.String(), response)
+			return
+		}
+	}
+
+	// Rule 3 & 4: handle incoming log entries
+	for i, entry := range req.LogEntries {
+		idx := req.PrevLogIndex + i + 1
+		if idx <= len(s.log) {
+			// Entry exists — check for conflict
+			if s.log[idx-1].Term != entry.Term {
+				// Conflict — truncate from here
+				s.log = s.log[:idx-1]
+				s.log = append(s.log, entry)
+			}
+			// else already have this entry, skip
+		} else {
+			// New entry — append
+			s.log = append(s.log, entry)
+		}
+	}
+
+	// Rule 5: update commitIndex
+	if req.LeaderCommit > s.commitIndex {
+		lastNewIndex := req.PrevLogIndex + len(req.LogEntries)
+		if req.LeaderCommit < lastNewIndex {
+			s.commitIndex = req.LeaderCommit
+		} else {
+			s.commitIndex = lastNewIndex
+		}
+		go s.applyCommitted()
+	}
+
 	response.Success = true
 	response.Term = s.currentTerm
-
-	// TODO Milestone 4: log consistency check goes here
-
 	s.sendMessage(from.String(), response)
+}
+
+func (s *Server) handleClientCommand(command string, from *net.UDPAddr) {
+	s.mu.Lock()
+
+	if s.state == Leader {
+		// Append to our own log
+		lastIndex, _ := s.lastLogInfo()
+		entry := miniraft.LogEntry{
+			Index:       lastIndex + 1,
+			Term:        s.currentTerm,
+			CommandName: command,
+		}
+		s.log = append(s.log, entry)
+		log.Printf("Leader appended entry: index=%d term=%d cmd=%s",
+			entry.Index, entry.Term, entry.CommandName)
+		s.mu.Unlock()
+
+		// Replicate to all followers
+		s.replicateLog()
+
+	} else if s.state == Follower && s.leaderID != "" {
+		// Forward to leader
+		log.Printf("Forwarding command %s to leader %s", command, s.leaderID)
+		s.mu.Unlock()
+		cmd := &ClientCommand{Command: command}
+		if err := s.sendMessage(s.leaderID, cmd); err != nil {
+			log.Printf("Failed to forward command to leader: %v", err)
+		}
+	} else {
+		// Candidate or no known leader — drop it
+		log.Printf("No leader known, dropping command: %s", command)
+		s.mu.Unlock()
+	}
+}
+
+func (s *Server) replicateLog() {
+	s.mu.Lock()
+	term := s.currentTerm
+	commitIndex := s.commitIndex
+	peers := s.peers
+	s.mu.Unlock()
+
+	for _, peer := range peers {
+		if peer == s.selfID {
+			continue
+		}
+		go func(target string) {
+			s.mu.Lock()
+
+			// Only replicate if we're still leader
+			if s.state != Leader {
+				s.mu.Unlock()
+				return
+			}
+
+			nextIdx := s.nextIndex[target]
+			prevLogIndex := nextIdx - 1
+			prevLogTerm := 0
+
+			// Find the term of the previous log entry
+			if prevLogIndex > 0 && prevLogIndex <= len(s.log) {
+				prevLogTerm = s.log[prevLogIndex-1].Term
+			}
+
+			// Entries to send — everything from nextIndex onwards
+			entries := []miniraft.LogEntry{}
+			if nextIdx <= len(s.log) {
+				entries = s.log[nextIdx-1:]
+			}
+
+			req := &miniraft.AppendEntriesRequest{
+				Term:         term,
+				LeaderId:     s.selfID,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				LogEntries:   entries,
+				LeaderCommit: commitIndex,
+			}
+			s.mu.Unlock()
+
+			if err := s.sendMessage(target, req); err != nil {
+				log.Printf("Failed to send AppendEntries to %s: %v", target, err)
+			}
+		}(peer)
+	}
+}
+
+func (s *Server) handleAppendEntriesResponse(res *miniraft.AppendEntriesResponse, from *net.UDPAddr) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if res.Term > s.currentTerm {
+		s.currentTerm = res.Term
+		s.state = Follower
+		s.votedFor = ""
+		return
+	}
+
+	if s.state != Leader {
+		return
+	}
+
+	// Match from.String() back to a peer identity
+	target := s.resolvePeer(from)
+	if target == "" {
+		return
+	}
+
+	if res.Success {
+		// Follower's log now matches ours up to nextIndex-1
+		// Advance matchIndex to the last entry we could have sent
+		lastIndex := 0
+		if len(s.log) > 0 {
+			lastIndex = s.log[len(s.log)-1].Index
+		}
+		if lastIndex > s.matchIndex[target] {
+			s.matchIndex[target] = lastIndex
+			s.nextIndex[target] = lastIndex + 1
+		}
+		s.advanceCommitIndex()
+	} else {
+		// Log inconsistency — back off
+		if s.nextIndex[target] > 1 {
+			s.nextIndex[target]--
+		}
+	}
+}
+
+// resolvePeer converts a UDP address back to a peer identity string
+func (s *Server) resolvePeer(from *net.UDPAddr) string {
+	for _, peer := range s.peers {
+		addr, err := net.ResolveUDPAddr("udp", peer)
+		if err != nil {
+			continue
+		}
+		if addr.Port == from.Port {
+			return peer
+		}
+	}
+	return ""
+}
+
+func (s *Server) advanceCommitIndex() {
+	// Find the highest N where a majority have matchIndex >= N
+	// and log[N].term == currentTerm (§5.4.2)
+	for n := len(s.log); n > s.commitIndex; n-- {
+		if s.log[n-1].Term != s.currentTerm {
+			continue
+		}
+		// Count how many servers have this entry
+		count := 1 // count ourselves
+		for _, peer := range s.peers {
+			if peer == s.selfID {
+				continue
+			}
+			if s.matchIndex[peer] >= n {
+				count++
+			}
+		}
+		if count >= s.majority() {
+			s.commitIndex = n
+			log.Printf("Advanced commitIndex to %d", s.commitIndex)
+			go s.applyCommitted()
+			break
+		}
+	}
+}
+
+func (s *Server) applyCommitted() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for s.lastApplied < s.commitIndex {
+		s.lastApplied++
+		entry := s.log[s.lastApplied-1]
+
+		// Write to log file: term,index,command
+		s.writeToLogFile(entry)
+		log.Printf("Applied entry: index=%d term=%d cmd=%s",
+			entry.Index, entry.Term, entry.CommandName)
+	}
+}
+
+func (s *Server) writeToLogFile(entry miniraft.LogEntry) {
+	filename := strings.ReplaceAll(s.selfID, ":", "-") + ".log"
+
+	// First write: truncate the file to start fresh
+	// Subsequent writes: append
+	flag := os.O_APPEND | os.O_CREATE | os.O_WRONLY
+	if !s.logFileReady {
+		flag = os.O_TRUNC | os.O_CREATE | os.O_WRONLY
+		s.logFileReady = true
+	}
+
+	f, err := os.OpenFile(filename, flag, 0644)
+	if err != nil {
+		log.Printf("Failed to open log file: %v", err)
+		return
+	}
+	defer f.Close()
+
+	line := fmt.Sprintf("%d,%d,%s\n", entry.Term, entry.Index, entry.CommandName)
+	if _, err := f.WriteString(line); err != nil {
+		log.Printf("Failed to write to log file: %v", err)
+	}
 }
