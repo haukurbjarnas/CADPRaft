@@ -1,0 +1,184 @@
+# Programming Assignment 3 — MiniRaft
+## Authors
+See the AUTHORS file for group member names and emails.
+
+## File Descriptions
+
+- `miniraft/miniraft.go` — Message type definitions and JSON marshal/unmarshal logic provided by the course. Defines LogEntry, AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, and RequestVoteResponse.
+- `raftserver/raftserver.go` — Main server implementation. Implements the Raft consensus algorithm including leader election, log replication, heartbeats, and the suspend/resume command interface.
+- `raftclient/raftclient.go` — Client implementation. Reads commands from stdin and sends them to a server over UDP.
+- `servers.txt` — Example cluster configuration file listing server identities.
+- `start.sh` — Helper script to launch all three servers simultaneously in separate Terminal windows on macOS.
+- `go.mod` — Go module definition.
+
+## Running the System
+
+Start three servers (replace GROUP with your group name):
+
+    go run raftserver/raftserver.go localhost:2000 servers.txt
+    go run raftserver/raftserver.go localhost:2001 servers.txt
+    go run raftserver/raftserver.go localhost:2002 servers.txt
+
+Start a client connected to any server:
+
+    go run raftclient/raftclient.go localhost:2000
+
+Server stdin commands: log, print, suspend, resume
+Client stdin commands: any valid command string, exit
+
+## Documentation
+
+### (a) Protocol Implementation Tracing
+
+The implementation follows Figure 2 of Ongaro and Ousterhout (2014) directly.
+Each function maps to a specific rule in the paper.
+
+**`startElection()` — Candidates §5.2**
+Implements the "On conversion to candidate" rule from Figure 2:
+- Increments `currentTerm`
+- Sets `votedFor = selfID`
+- Sets `voteCount = 1` (votes for itself)
+- Sends `RequestVoteRequest` to all peers in parallel
+- If no majority after timeout, calls itself recursively to start a new election
+
+**`handleRequestVote()` — RequestVote RPC receiver implementation**
+Implements the two receiver rules from Figure 2:
+- Rule 1: Returns false if `req.Term < currentTerm`
+- Rule 2: Grants vote if `votedFor` is null or already this candidate, AND candidate's
+  log is at least as up-to-date as ours (compared via `lastLogTerm` then `lastLogIndex`)
+- If `req.Term > currentTerm`, updates term and reverts to Follower first (All Servers rule)
+
+**`handleRequestVoteResponse()` — Candidates §5.2**
+Implements the "If votes received from majority" rule:
+- Ignores responses if no longer Candidate
+- Steps down if response contains higher term (All Servers rule)
+- Calls `becomeLeader()` exactly once when `voteCount == majority()`
+
+**`becomeLeader()` — Leaders §5.2**
+Implements the "Upon election" rule:
+- Initializes `nextIndex[peer] = lastLogIndex + 1` for all peers
+- Initializes `matchIndex[peer] = 0` for all peers
+- Starts `runHeartbeat()` goroutine
+
+**`runHeartbeat()` — Leaders §5.2**
+Implements "repeat during idle periods to prevent election timeouts":
+- Sends AppendEntries (with or without log entries) every 75ms via `replicateLog()`
+- Stops immediately if state is no longer Leader
+
+**`handleAppendEntries()` — AppendEntries RPC receiver implementation**
+Implements all 5 receiver rules from Figure 2:
+- Rule 1: Returns false if `req.Term < currentTerm`
+- Rule 2: Returns false if log does not contain entry at `prevLogIndex` with matching `prevLogTerm`
+- Rule 3: Truncates conflicting entries (same index, different term)
+- Rule 4: Appends new entries not already in log
+- Rule 5: Updates `commitIndex = min(leaderCommit, lastNewIndex)` if `leaderCommit > commitIndex`
+- Also resets election timer on valid leader contact (Followers rule)
+
+**`handleAppendEntriesResponse()` — Leaders §5.3**
+Implements the leader response handling rules from Figure 2:
+- On success: advances `matchIndex[peer]` and `nextIndex[peer]`
+- On failure: decrements `nextIndex[peer]` and retries on next heartbeat
+- Steps down if response contains higher term (All Servers rule)
+
+**`advanceCommitIndex()` — Leaders §5.3, §5.4**
+Implements the commit rule from Figure 2:
+- Finds the highest N where a majority of `matchIndex[i] >= N`
+- Crucially checks `log[N].term == currentTerm` per §5.4.2 to prevent unsafe commits
+- Advances `commitIndex` to N and triggers `applyCommitted()`
+
+**`applyCommitted()` — All Servers §5.3**
+Implements the "If commitIndex > lastApplied" rule from Figure 2:
+- Increments `lastApplied` for each entry up to `commitIndex`
+- Writes each committed entry to the `.log` file in order
+
+**`runElectionTimer()` — Followers §5.2**
+Implements "If election timeout elapses without receiving AppendEntries RPC":
+- Uses randomized timeout of 300-600ms per §5.2 (wider than paper's 150-300ms for stability)
+- Only fires election if state is Follower
+- Resets whenever `resetElection` channel receives a signal from a valid heartbeat or granted vote
+
+### (b) Request and Response Tracking
+
+The implementation ensures that most client commands are eventually committed
+through several mechanisms:
+
+**Client command forwarding:** Followers that receive client commands immediately
+forward them to the known leader via `handleClientCommand()`. This means a client
+can connect to any server and its command will reach the leader.
+
+**Leader retry via heartbeat:** The leader does not send a single AppendEntries and
+give up. Instead, `replicateLog()` is called both when a new command arrives AND on
+every heartbeat tick (every 75ms). If an AppendEntries is lost due to UDP packet
+loss, it will automatically be retried on the next heartbeat.
+
+**`nextIndex` backtracking:** If a follower rejects an AppendEntries due to log
+inconsistency, `handleAppendEntriesResponse()` decrements `nextIndex[peer]`. On the
+next heartbeat, the leader retries with an earlier log entry. This continues until
+the logs converge and the follower accepts.
+
+**`matchIndex` tracking:** The leader tracks the highest confirmed replicated index
+per peer in `matchIndex`. `advanceCommitIndex()` uses this to find the highest index
+that a majority of servers have confirmed, ensuring commits only happen when safe.
+
+**Why "most" not "all":** Raft does not guarantee every command is committed.
+Commands sent to a Candidate (no leader known yet) or dropped during a network
+partition may be lost. This is acceptable per the assignment specification.
+
+### (c) Heartbeat Mechanism and Election Timing
+
+**How a working leader prevents elections:**
+
+`runHeartbeat()` sends an AppendEntries RPC to every peer every 75ms via
+`replicateLog()`. When a follower receives this in `handleAppendEntries()`, it sends
+a signal to the `resetElection` channel. `runElectionTimer()` is blocked in a select
+statement waiting on either this channel or a `time.After(timeout)`. Receiving from
+the channel causes the loop to restart with a fresh timeout, resetting the countdown.
+Since heartbeats arrive every 75ms and the election timeout is 300-600ms, a follower
+will always reset before timing out as long as the leader is alive. This satisfies
+the timing requirement broadcastTime << electionTimeout from §5.6 of the paper.
+
+**How missing heartbeats trigger elections:**
+
+If the leader is suspended or crashes, heartbeats stop. `runElectionTimer()` no
+longer receives on `resetElection` and eventually `time.After(timeout)` fires. The
+goroutine checks that state is Follower and calls `startElection()`. The timeout is
+randomized between 300-600ms — this ensures servers time out at different times,
+making split votes rare as described in §5.2.
+
+**The Failed state:**
+
+When a server is suspended (`state == Failed`), `runElectionTimer()` detects this
+at the top of its loop and sleeps for 50ms before checking again, never starting an
+election. When resumed, `resumedAt` is set to `time.Now()` and `runElectionTimer()`
+gives a 200ms grace period before starting the election countdown, allowing incoming
+heartbeats to arrive and reset the timer first.
+
+### (d) Deadlock Freedom and Progress
+
+**No deadlocks:**
+
+The implementation uses a single mutex (`s.mu`) throughout. A deadlock with a single
+mutex can only occur if a goroutine tries to acquire it while already holding it.
+We prevent this by:
+- Always using `defer s.mu.Unlock()` or explicitly unlocking before any blocking operation
+- `sendMessage()` is called while holding the lock in some handlers, but it only
+  calls `conn.WriteTo()` which is a non-blocking UDP write and does not acquire any lock
+- Message handlers run in separate goroutines via `go s.handleMessage(...)` so the
+  receive loop never blocks waiting for a handler to finish
+
+**Progress guaranteed:**
+
+The system makes progress because:
+- As long as a majority of servers are alive, a leader will eventually be elected.
+  Randomized timeouts prevent indefinite split votes per §5.2.
+- Once a leader exists, it retries AppendEntries on every heartbeat until followers
+  confirm, so committed entries always propagate to all live servers.
+- The Failed state correctly prevents suspended servers from disrupting elections
+  or replication — they receive messages but never respond or initiate.
+- No goroutine holds the mutex while sleeping or waiting on a channel. The mutex
+  is always released before any blocking operation, ensuring other goroutines can
+  always make progress.
+
+## AI Tool Usage
+
+
