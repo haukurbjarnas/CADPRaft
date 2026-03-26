@@ -149,9 +149,9 @@ making split votes rare as described in §5.2.
 
 When a server is suspended (`state == Failed`), `runElectionTimer()` detects this
 at the top of its loop and sleeps for 50ms before checking again, never starting an
-election. When resumed, `resumedAt` is set to `time.Now()` and `runElectionTimer()`
-gives a 200ms grace period before starting the election countdown, allowing incoming
-heartbeats to arrive and reset the timer first.
+election. When resumed, `runElectionTimer()` gives a 200ms grace period before 
+starting the election countdown, allowing incoming heartbeats to arrive and reset 
+the timer first.
 
 ### (d) Deadlock Freedom and Progress
 

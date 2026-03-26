@@ -494,41 +494,6 @@ func (s *Server) becomeLeader() {
 	go s.runHeartbeat()
 }
 
-/*func (s *Server) runHeartbeat() {
-	for {
-		s.mu.Lock()
-		state := s.state
-		term := s.currentTerm
-		s.mu.Unlock()
-
-		// Stop sending heartbeats if we're no longer leader
-		if state != Leader {
-			return
-		}
-
-		// Send empty AppendEntries to all peers as heartbeat
-		for _, peer := range s.peers {
-			if peer == s.selfID {
-				continue
-			}
-			go func(target string) {
-				req := &miniraft.AppendEntriesRequest{
-					Term:         term,
-					LeaderId:     s.selfID,
-					LeaderCommit: 0, // will update in Milestone 4
-				}
-				if err := s.sendMessage(target, req); err != nil {
-					log.Printf("Failed to send heartbeat to %s: %v", target, err)
-				}
-			}(peer)
-		}
-
-		// Heartbeat interval should be well below election timeout
-		// Paper recommends broadcastTime << electionTimeout
-		// We use 75ms (half of minimum election timeout of 150ms)
-		time.Sleep(75 * time.Millisecond)
-	}
-}*/
 
 func (s *Server) runHeartbeat() {
 	for {
