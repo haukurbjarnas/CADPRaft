@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"raft-groupX/miniraft"
+	"raft-group5/miniraft"
 )
 
 // Server holds all the state for this Raft node
@@ -303,6 +303,10 @@ func readConfig(filename string) ([]string, error) {
 	return servers, scanner.Err()
 }
 
+// runElectionTimer implements the Follower election timeout rule from Figure 2:
+// "If election timeout elapses without receiving AppendEntries RPC from current
+// leader or granting vote to candidate: convert to candidate" (§5.2)
+// Randomized timeout of 300-600ms satisfies broadcastTime << electionTimeout (§5.6)
 func (s *Server) runElectionTimer() {
 	for {
 		// Check state at the start of each loop iteration
@@ -310,7 +314,7 @@ func (s *Server) runElectionTimer() {
 		state := s.state
 		s.mu.Unlock()
 
-		// If Failed, wait a bit and check again — don't start timing
+		// If Failed, wait a bit and check again
 		if state == Failed {
 			time.Sleep(50 * time.Millisecond)
 			continue
@@ -333,6 +337,12 @@ func (s *Server) runElectionTimer() {
 	}
 }
 
+// startElection implements the Candidate election rules from Figure 2 (§5.2):
+// "On conversion to candidate, start election:
+//   - Increment currentTerm
+//   - Vote for self
+//   - Reset election timer
+//   - Send RequestVote RPCs to all other servers"
 func (s *Server) startElection() {
 
 	s.mu.Lock()
@@ -368,13 +378,12 @@ func (s *Server) startElection() {
 		}(peer)
 	}
 
-	// Wait for election timeout — if we haven't won by then, start a new one
-	// This replaces the timer goroutine re-triggering us
+	// Wait for election timeout — if haven't won by then, start a new one
 	timeout := time.Duration(300+rand.Intn(300)) * time.Millisecond
 	time.Sleep(timeout)
 
 	s.mu.Lock()
-	// If we're still a Candidate after the timeout, start a new election
+	// If still a Candidate after the timeout, start a new election
 	stillCandidate := s.state == Candidate
 	s.mu.Unlock()
 
@@ -391,6 +400,10 @@ func (s *Server) lastLogInfo() (int, int) {
 	return last.Index, last.Term
 }
 
+// handleRequestVote implements the RequestVote RPC receiver from Figure 2 (§5.2, §5.4):
+// Rule 1: Reply false if term < currentTerm
+// Rule 2: If votedFor is null or candidateId, and candidate's log is at least
+//         as up-to-date as receiver's log, grant vote
 func (s *Server) handleRequestVote(req *miniraft.RequestVoteRequest, from *net.UDPAddr) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -400,21 +413,19 @@ func (s *Server) handleRequestVote(req *miniraft.RequestVoteRequest, from *net.U
 		VoteGranted: false,
 	}
 
-	// Rule 1 from Figure 2: reply false if term < currentTerm
+	// Rule 1
 	if req.Term < s.currentTerm {
 		s.sendMessage(from.String(), response)
 		return
 	}
 
-	// If we see a higher term, update and revert to follower
 	if req.Term > s.currentTerm {
 		s.currentTerm = req.Term
 		s.state = Follower
 		s.votedFor = ""
 	}
 
-	// Rule 2: grant vote if votedFor is null or candidateId,
-	// AND candidate's log is at least as up-to-date as ours
+	// Rule 2
 	lastIndex, lastTerm := s.lastLogInfo()
 	logOK := req.LastLogTerm > lastTerm ||
 		(req.LastLogTerm == lastTerm && req.LastLogIndex >= lastIndex)
@@ -437,11 +448,14 @@ func (s *Server) handleRequestVote(req *miniraft.RequestVoteRequest, from *net.U
 	s.sendMessage(from.String(), response)
 }
 
+// handleRequestVoteResponse implements the Candidate vote-counting rule from Figure 2 (§5.2):
+// "If votes received from majority of servers: become leader"
+// Also implements All Servers rule: step down if response contains higher term (§5.1)
 func (s *Server) handleRequestVoteResponse(res *miniraft.RequestVoteResponse, from *net.UDPAddr) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If we see a higher term, step down
+	// If see a higher term, step down
 	if res.Term > s.currentTerm {
 		s.currentTerm = res.Term
 		s.state = Follower
@@ -449,7 +463,7 @@ func (s *Server) handleRequestVoteResponse(res *miniraft.RequestVoteResponse, fr
 		return
 	}
 
-	// Only count votes if we're still a Candidate
+	// Only count votes if still a Candidate
 	if s.state != Candidate {
 		return
 	}
@@ -458,8 +472,8 @@ func (s *Server) handleRequestVoteResponse(res *miniraft.RequestVoteResponse, fr
 		s.voteCount++
 		log.Printf("Got vote, total=%d needed=%d", s.voteCount, s.majority())
 
-		// Only transition once — check we haven't already become leader
-		if s.voteCount == s.majority() { // == not >= so it only fires exactly once
+		// Only transition once 
+		if s.voteCount == s.majority() {
 			go s.becomeLeader()
 		}
 	}
@@ -469,6 +483,9 @@ func (s *Server) majority() int {
 	return len(s.peers)/2 + 1
 }
 
+// becomeLeader implements the Leader initialization rules from Figure 2 (§5.2, §5.3):
+// "Upon election: send initial empty AppendEntries RPCs (heartbeat) to each server"
+// Reinitializes nextIndex[] and matchIndex[] for all peers after election
 func (s *Server) becomeLeader() {
 	s.mu.Lock()
 	if s.state != Candidate {
@@ -494,7 +511,10 @@ func (s *Server) becomeLeader() {
 	go s.runHeartbeat()
 }
 
-
+// runHeartbeat implements the Leader heartbeat rule from Figure 2 (§5.2):
+// "repeat during idle periods to prevent election timeouts"
+// Heartbeat interval of 75ms satisfies broadcastTime << electionTimeout (§5.6)
+// Also serves as log replication trigger per §5.3
 func (s *Server) runHeartbeat() {
 	for {
 		s.mu.Lock()
@@ -512,6 +532,13 @@ func (s *Server) runHeartbeat() {
 	}
 }
 
+// handleAppendEntries implements the AppendEntries RPC receiver from Figure 2 (§5.3):
+// Rule 1: Reply false if term < currentTerm
+// Rule 2: Reply false if log doesn't contain entry at prevLogIndex matching prevLogTerm
+// Rule 3: If existing entry conflicts with new one, delete it and all that follow
+// Rule 4: Append any new entries not already in the log
+// Rule 5: If leaderCommit > commitIndex, update commitIndex
+// Also implements Follower rule: reset election timer on valid AppendEntries (§5.2)
 func (s *Server) handleAppendEntries(req *miniraft.AppendEntriesRequest, from *net.UDPAddr) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -521,7 +548,7 @@ func (s *Server) handleAppendEntries(req *miniraft.AppendEntriesRequest, from *n
 		Success: false,
 	}
 
-	// Rule 1: reply false if term < currentTerm
+	// Rule 1
 	if req.Term < s.currentTerm {
 		s.sendMessage(from.String(), response)
 		return
@@ -540,16 +567,13 @@ func (s *Server) handleAppendEntries(req *miniraft.AppendEntriesRequest, from *n
 	default:
 	}
 
-	// Rule 2: reply false if log doesn't contain entry at prevLogIndex
-	// with matching prevLogTerm
+	// Rule 2
 	if req.PrevLogIndex > 0 {
 		if req.PrevLogIndex > len(s.log) {
-			// We don't have this entry at all
 			s.sendMessage(from.String(), response)
 			return
 		}
 		if s.log[req.PrevLogIndex-1].Term != req.PrevLogTerm {
-			// Term mismatch at prevLogIndex
 			s.sendMessage(from.String(), response)
 			return
 		}
@@ -559,20 +583,17 @@ func (s *Server) handleAppendEntries(req *miniraft.AppendEntriesRequest, from *n
 	for i, entry := range req.LogEntries {
 		idx := req.PrevLogIndex + i + 1
 		if idx <= len(s.log) {
-			// Entry exists — check for conflict
 			if s.log[idx-1].Term != entry.Term {
-				// Conflict — truncate from here
 				s.log = s.log[:idx-1]
 				s.log = append(s.log, entry)
 			}
-			// else already have this entry, skip
 		} else {
 			// New entry — append
 			s.log = append(s.log, entry)
 		}
 	}
 
-	// Rule 5: update commitIndex
+	// Rule 5
 	if req.LeaderCommit > s.commitIndex {
 		lastNewIndex := req.PrevLogIndex + len(req.LogEntries)
 		if req.LeaderCommit < lastNewIndex {
@@ -588,11 +609,14 @@ func (s *Server) handleAppendEntries(req *miniraft.AppendEntriesRequest, from *n
 	s.sendMessage(from.String(), response)
 }
 
+// handleClientCommand implements the Leader client command rule from Figure 2 (§5.3):
+// "If command received from client: append entry to local log"
+// Followers forward to leader per assignment spec (§5.1 follower redirection)
 func (s *Server) handleClientCommand(command string, from *net.UDPAddr) {
 	s.mu.Lock()
 
 	if s.state == Leader {
-		// Append to our own log
+		// Append to own log
 		lastIndex, _ := s.lastLogInfo()
 		entry := miniraft.LogEntry{
 			Index:       lastIndex + 1,
@@ -622,6 +646,9 @@ func (s *Server) handleClientCommand(command string, from *net.UDPAddr) {
 	}
 }
 
+// replicateLog implements the Leader log replication rule from Figure 2 (§5.3):
+// "If last log index >= nextIndex for a follower: send AppendEntries RPC
+//  with log entries starting at nextIndex"
 func (s *Server) replicateLog() {
 	s.mu.Lock()
 	term := s.currentTerm
@@ -636,7 +663,7 @@ func (s *Server) replicateLog() {
 		go func(target string) {
 			s.mu.Lock()
 
-			// Only replicate if we're still leader
+			// Only replicate if still leader
 			if s.state != Leader {
 				s.mu.Unlock()
 				return
@@ -674,6 +701,10 @@ func (s *Server) replicateLog() {
 	}
 }
 
+// handleAppendEntriesResponse implements the Leader response handling rules from Figure 2 (§5.3):
+// On success: "update nextIndex and matchIndex for follower"
+// On failure: "decrement nextIndex and retry"
+// Also implements All Servers rule: step down if response contains higher term (§5.1)
 func (s *Server) handleAppendEntriesResponse(res *miniraft.AppendEntriesResponse, from *net.UDPAddr) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -689,7 +720,6 @@ func (s *Server) handleAppendEntriesResponse(res *miniraft.AppendEntriesResponse
 		return
 	}
 
-	// Match from.String() back to a peer identity
 	target := s.resolvePeer(from)
 	if target == "" {
 		return
@@ -729,15 +759,19 @@ func (s *Server) resolvePeer(from *net.UDPAddr) string {
 	return ""
 }
 
+// advanceCommitIndex implements the Leader commit rule from Figure 2 (§5.3, §5.4):
+// "If there exists an N such that N > commitIndex, a majority of matchIndex[i] >= N,
+//  and log[N].term == currentTerm: set commitIndex = N"
+// The currentTerm check is critical per §5.4.2 — prevents unsafe commits of old entries
 func (s *Server) advanceCommitIndex() {
 	// Find the highest N where a majority have matchIndex >= N
-	// and log[N].term == currentTerm (§5.4.2)
+	// and log[N].term == currentTerm
 	for n := len(s.log); n > s.commitIndex; n-- {
 		if s.log[n-1].Term != s.currentTerm {
 			continue
 		}
 		// Count how many servers have this entry
-		count := 1 // count ourselves
+		count := 1 // count self
 		for _, peer := range s.peers {
 			if peer == s.selfID {
 				continue
@@ -755,6 +789,10 @@ func (s *Server) advanceCommitIndex() {
 	}
 }
 
+// applyCommitted implements the All Servers state machine rule from Figure 2 (§5.3):
+// "If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied]
+//  to state machine"
+// Writing to the .log file serves as our state machine application
 func (s *Server) applyCommitted() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

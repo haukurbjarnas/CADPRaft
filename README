@@ -180,5 +180,5 @@ The system makes progress because:
   always make progress.
 
 ## AI Tool Usage
-
-
+This project was developed with assistance from ChatGPT. Full transcripts
+of all AI interactions are included in the agentlogs/ directory.
